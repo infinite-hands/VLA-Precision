@@ -237,6 +237,11 @@ class OpenPIModelOverrides:
     action_dim: int = 32
     action_horizon: int = 50
     max_token_len: int = 200
+    # Per-action-dimension loss weights, length action_dim. Empty (the default) means an unweighted
+    # mean, so every existing config behaves exactly as before. Set it for a single-arm corpus on a
+    # bimanual embodiment: the arm the model does not drive is pinned to a constant pose, so its
+    # dimensions are trivially predictable yet a flat mean still spends half the action loss there.
+    action_dim_weights: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)

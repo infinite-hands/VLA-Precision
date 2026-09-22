@@ -221,6 +221,9 @@ def build_stage1_train_config(config: Stage1Config) -> openpi_config.TrainConfig
         action_dim=config.openpi.model.action_dim,
         action_horizon=config.openpi.model.action_horizon,
         max_token_len=config.openpi.model.max_token_len,
+        # None, not (), is Pi0Config's "unweighted" sentinel -- it takes a plain mean then, which
+        # keeps every config that does not set weights bit-identical to before.
+        action_dim_weights=tuple(config.openpi.model.action_dim_weights) or None,
     )
     return dataclasses.replace(
         base,
