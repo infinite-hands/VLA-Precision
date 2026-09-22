@@ -85,8 +85,8 @@ override-dependencies = [
 [tool.uv.sources]
 agentlace = { git = "https://github.com/youliangtan/agentlace.git", rev = "cf2c337c5e3694cdbfc14831b239bd657bc4894d" }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "d6ea3bbce0fc8c75138f02639ac4ceaf12a67829" }
-openpi = { git = "https://github.com/Physical-Intelligence/openpi.git", rev = "2d70d966582e711128ad8358d8dbf23d2cc3d658" }
-openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client", rev = "2d70d966582e711128ad8358d8dbf23d2cc3d658" }
+openpi = { git = "https://github.com/infinite-hands/openpi.git", rev = "bdc24c8aaa0666d2917dc5afcc613a75f47d8652" }
+openpi-client = { git = "https://github.com/infinite-hands/openpi.git", subdirectory = "packages/openpi-client", rev = "bdc24c8aaa0666d2917dc5afcc613a75f47d8652" }
 
 [tool.ruff]
 line-length = 120

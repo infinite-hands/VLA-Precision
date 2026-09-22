@@ -1949,7 +1949,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/36/2f/5b2b3ba52c8648488
 [[package]]
 name = "openpi"
 version = "0.1.0"
-source = { git = "https://github.com/Physical-Intelligence/openpi.git?rev=2d70d966582e711128ad8358d8dbf23d2cc3d658#2d70d966582e711128ad8358d8dbf23d2cc3d658" }
+source = { git = "https://github.com/infinite-hands/openpi.git?rev=bdc24c8aaa0666d2917dc5afcc613a75f47d8652#bdc24c8aaa0666d2917dc5afcc613a75f47d8652" }
 dependencies = [
     { name = "augmax" },
     { name = "beartype" },
@@ -1987,7 +1987,7 @@ dependencies = [
 [[package]]
 name = "openpi-client"
 version = "0.1.0"
-source = { git = "https://github.com/Physical-Intelligence/openpi.git?subdirectory=packages%2Fopenpi-client&rev=2d70d966582e711128ad8358d8dbf23d2cc3d658#2d70d966582e711128ad8358d8dbf23d2cc3d658" }
+source = { git = "https://github.com/infinite-hands/openpi.git?subdirectory=packages%2Fopenpi-client&rev=bdc24c8aaa0666d2917dc5afcc613a75f47d8652#bdc24c8aaa0666d2917dc5afcc613a75f47d8652" }
 dependencies = [
     { name = "dm-tree" },
     { name = "msgpack" },
@@ -3423,7 +3423,7 @@ real-robot = [
     { name = "flask", specifier = "==3.1.3" },
     { name = "lerobot", git = "https://github.com/huggingface/lerobot?rev=d6ea3bbce0fc8c75138f02639ac4ceaf12a67829" },
     { name = "opencv-python", specifier = ">=4.10.0.84" },
-    { name = "openpi-client", git = "https://github.com/Physical-Intelligence/openpi.git?subdirectory=packages%2Fopenpi-client&rev=2d70d966582e711128ad8358d8dbf23d2cc3d658" },
+    { name = "openpi-client", git = "https://github.com/infinite-hands/openpi.git?subdirectory=packages%2Fopenpi-client&rev=bdc24c8aaa0666d2917dc5afcc613a75f47d8652" },
     { name = "pydhgripper", specifier = "==1.0.2" },
     { name = "pynput", specifier = ">=1.8.2" },
     { name = "pyrealsense2", specifier = "==2.56.5.9235" },
@@ -3439,7 +3439,7 @@ real-robot = [
 stage1 = [
     { name = "chex", specifier = ">=0.1.85" },
     { name = "lerobot", git = "https://github.com/huggingface/lerobot?rev=d6ea3bbce0fc8c75138f02639ac4ceaf12a67829" },
-    { name = "openpi", git = "https://github.com/Physical-Intelligence/openpi.git?rev=2d70d966582e711128ad8358d8dbf23d2cc3d658" },
+    { name = "openpi", git = "https://github.com/infinite-hands/openpi.git?rev=bdc24c8aaa0666d2917dc5afcc613a75f47d8652" },
     { name = "optax", specifier = ">=0.1.5" },
     { name = "pandas", specifier = ">=2.2.0" },
     { name = "polars", specifier = ">=1.30.0" },
@@ -3453,7 +3453,7 @@ stage2 = [
     { name = "distrax", specifier = ">=0.1.2" },
     { name = "lerobot", git = "https://github.com/huggingface/lerobot?rev=d6ea3bbce0fc8c75138f02639ac4ceaf12a67829" },
     { name = "msgpack", specifier = ">=1.0.5" },
-    { name = "openpi", git = "https://github.com/Physical-Intelligence/openpi.git?rev=2d70d966582e711128ad8358d8dbf23d2cc3d658" },
+    { name = "openpi", git = "https://github.com/infinite-hands/openpi.git?rev=bdc24c8aaa0666d2917dc5afcc613a75f47d8652" },
     { name = "optax", specifier = ">=0.1.5" },
     { name = "pandas", specifier = ">=2.2.0" },
     { name = "polars", specifier = ">=1.30.0" },
