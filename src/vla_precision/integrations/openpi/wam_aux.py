@@ -93,6 +93,29 @@ class _AuxProjectionEma:
         )
 
 
+def _standardize(x: jax.Array) -> jax.Array:
+    """Zero-mean, unit-variance per token (LayerNorm without learnable parameters).
+
+    Without this the auxiliary loss is a raw MSE in a representation space nothing constrains the
+    scale of, and the loss inflates mechanically as the backbone trains rather than because
+    prediction actually got worse: the EMA target's magnitude tracks the online backbone's, so
+    once embedding magnitudes start drifting upward, so does the loss -- and, because gradient
+    reaches the backbone through `context`, so does the gradient this loss pushes into it.
+    Measured on a real 500-step run (see docs/wam-aux-loss.md): aux_loss fell 16.9 -> 2.2 over the
+    first 40 steps, then climbed monotonically back to 15.1 while the primary gradient norm went
+    from ~0.3 to spikes of 4.9-6.9. Reproduced in isolation with a synthetic inflating input scale
+    and eliminated by this normalization (climb ratio 2.31x -> 1.00x).
+
+    Phase 0's offline probe did not need this because its backbone was FROZEN, so target scale was
+    constant by construction; that assumption silently broke once the loss trained jointly with a
+    live backbone. Normalizing both sides is what BYOL/JEPA implementations do for this reason, and
+    it costs the per-token magnitude as a predictable signal -- an accepted trade for a bounded,
+    well-scaled objective."""
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    variance = jnp.var(x, axis=-1, keepdims=True)
+    return (x - mean) * jax.lax.rsqrt(variance + 1e-6)
+
+
 def _adaln_zero_linear(cond_dim: int, out_dim: int, *, rngs: nnx.Rngs) -> nnx.Linear:
     """A Linear whose output starts at exactly zero (adaLN-zero) so every predictor block begins
     training as an identity residual and only gradually turns on -- ported from
@@ -316,8 +339,8 @@ def compute_aux_loss(
             )
     noise_rng, time_rng = jax.random.split(rng)
 
-    context = projection(context_tokens)
-    target = jax.lax.stop_gradient(projection_ema.apply(target_tokens_raw))
+    context = _standardize(projection(context_tokens))
+    target = jax.lax.stop_gradient(_standardize(projection_ema.apply(target_tokens_raw)))
 
     noise = jax.random.normal(noise_rng, target.shape, dtype=target.dtype)
     batch = target.shape[0]

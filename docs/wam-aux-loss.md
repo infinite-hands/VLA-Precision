@@ -58,6 +58,34 @@ Ported from the offline probe's validated design (`aux_probe_predictor.py`):
   `noised = (1 - tau) * noise + tau * target`, velocity target `target - noise`. This is ported
   byte-for-byte from the validated offline code, not pi0.5's own Beta(1.5, 1) time-sampling
   convention — the two aren't the same mechanism.
+- Both `context` and `target` are standardized per token (`wam_aux._standardize`, a LayerNorm with
+  no learnable parameters) before the loss. This is load-bearing, not cosmetic — see below.
+
+## Why the target is normalized (a real bug this caught)
+
+The first 500-step validation run looked healthy for ~40 steps and then went wrong: `aux_loss` fell
+16.9 → 2.2, then climbed monotonically back to 15.1 over the remaining ~450 steps, while the
+primary model's gradient norm went from ~0.3 to spikes of 4.9-6.9.
+
+The cause was not the prediction task degrading. It was that the loss was a raw, *unnormalized* MSE
+in a representation space whose scale nothing constrained. The EMA target's magnitude tracks the
+online backbone's, so once the backbone's embedding magnitudes drifted upward during fine-tuning,
+the MSE inflated mechanically. Because gradient reaches the backbone through `context`, the loss
+was then feeding a growing *scale-driven* rather than *signal-driven* gradient into the model being
+fine-tuned — which is what the primary gradient-norm spikes were.
+
+Phase 0's offline probe never hit this because its backbone was frozen: target scale was constant
+by construction, and that assumption silently broke once the loss trained jointly with a live
+backbone. Isolated reproduction (no backbone, synthetic inputs, 500 steps):
+
+| scenario | climb ratio |
+|---|---|
+| stationary input scale, unnormalized target | 1.04x (flat) |
+| inflating input scale, unnormalized target | 2.31x (reproduces the failure) |
+| inflating input scale, normalized target | 1.00x (fixed) |
+
+Normalizing both sides is what BYOL/JEPA implementations do for exactly this reason. It costs the
+per-token magnitude as a predictable signal, which is an accepted trade for a bounded objective.
 
 ## Separate optimizer state
 
