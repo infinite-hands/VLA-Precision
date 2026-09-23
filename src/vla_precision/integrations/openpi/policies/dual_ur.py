@@ -19,6 +19,32 @@ def make_dual_ur_example() -> dict:
     }
 
 
+# The one camera the WAM auxiliary future-prediction loss targets (see docs/wam-aux-loss.md).
+# Named here since this is where the real "image" dict keys are defined; train.py imports this
+# rather than re-declaring the literal.
+RIGHT_WRIST_CAMERA_KEY = "right_wrist_0_rgb"
+
+# The repack-level wire key data_configs.py's LeRobotDualUR5eDataConfig writes the future
+# right-wrist frame under, and this file's DualURInputs reads it back from (see
+# docs/wam-aux-loss.md). Named once here rather than as a bare string literal in both files, so a
+# typo on either side cannot silently degrade to "aux quietly disabled" (DualURInputs below guards
+# with `if ... in data`, so a mismatched key would otherwise just skip the aux branch, not error).
+FUTURE_RIGHT_WRIST_REPACK_KEY = "observation/future_right_wrist_image"
+# Marks samples where LeRobot clamped the future index at an episode boundary, so the "future"
+# frame is really the current one. Masked out of the loss rather than averaged in.
+FUTURE_RIGHT_WRIST_PAD_KEY = "observation/future_right_wrist_is_pad"
+AUX_FUTURE_PAD_KEY = "aux_future_is_pad"
+
+# WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md): the future right-wrist frame
+# is stashed under this key INSIDE inputs["image"] (not as its own top-level key) purely so
+# ResizeImages -- which resizes every key in data["image"] generically -- resizes it exactly like
+# the three real cameras. It carries no "image_mask" entry and DataLoaderImplWithAux
+# (data_loader.py) pops it back out of the batched "image" dict before Observation.from_dict()
+# runs, since from_dict() builds `images=data["image"]` verbatim and would otherwise hand it to
+# embed_prefix() as a fourth real camera.
+AUX_FUTURE_IMAGE_KEY = f"__aux_future_{RIGHT_WRIST_CAMERA_KEY}"
+
+
 def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
@@ -83,6 +109,15 @@ class DualURInputs(transforms.DataTransformFn):
         # stored in "prompt"; the output dict always needs to have the key "prompt").
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md), only present when
+        # aux_loss_weight > 0. Placed inside inputs["image"] under AUX_FUTURE_IMAGE_KEY (see its
+        # docstring above) so ResizeImages resizes it identically to the real cameras;
+        # DataLoaderImplWithAux strips it back out of "image" before Observation.from_dict() so it
+        # never reaches embed_prefix()'s per-camera loop.
+        if FUTURE_RIGHT_WRIST_REPACK_KEY in data:
+            inputs["image"][AUX_FUTURE_IMAGE_KEY] = _parse_image(data[FUTURE_RIGHT_WRIST_REPACK_KEY])
+            inputs[AUX_FUTURE_PAD_KEY] = np.asarray(data[FUTURE_RIGHT_WRIST_PAD_KEY], dtype=bool)
 
         return inputs
 

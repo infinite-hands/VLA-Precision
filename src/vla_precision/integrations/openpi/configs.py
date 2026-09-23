@@ -155,14 +155,13 @@ def supported_configs() -> tuple[str, ...]:
     return tuple(_CONFIGS_DICT)
 
 
-def _overlay_data(base, data):
+def _overlay_data(base, data, *, aux_loss_offset_k: int | None = None):
     base_config = dataclasses.replace(
         base.base_config or openpi_config.DataConfig(),
         prompt_from_task=data.prompt_from_task,
         action_sequence_keys=(data.action_key,),
     )
-    return dataclasses.replace(
-        base,
+    overrides = dict(
         repo_id=data.lerobot_repo_id,
         base_config=base_config,
         state_key=data.state_key,
@@ -170,6 +169,17 @@ def _overlay_data(base, data):
         image_key_map=dict(data.image_key_map),
         extra_delta_transform=data.extra_delta_transform,
     )
+    # WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md): only LeRobotDualUR5eDataConfig
+    # implements it (the right-wrist camera it targets is a dual-arm-only concept here). Fail loudly
+    # rather than silently no-op if someone enables it on a config that can't honor it.
+    if aux_loss_offset_k is not None:
+        if not hasattr(base, "aux_loss_offset_k"):
+            raise ValueError(
+                f"aux_loss_weight > 0 requires a dual-arm data config (LeRobotDualUR5eDataConfig), "
+                f"got {type(base).__name__}, which has no right_wrist_0_rgb camera to target."
+            )
+        overrides["aux_loss_offset_k"] = aux_loss_offset_k
+    return dataclasses.replace(base, **overrides)
 
 
 def _lr(value):
@@ -222,12 +232,25 @@ def build_stage1_train_config(config: Stage1Config) -> openpi_config.TrainConfig
         action_horizon=config.openpi.model.action_horizon,
         max_token_len=config.openpi.model.max_token_len,
     )
+    if config.openpi.aux_loss_weight > 0 and config.openpi.ema_decay is None:
+        raise ValueError(
+            "aux_loss_weight > 0 requires ema_decay to be set (the auxiliary loss's target "
+            "encoder is the EMA copy of the model) -- got ema_decay=None."
+        )
+    if config.openpi.aux_loss_weight > 0 and not (0 < config.openpi.aux_loss_offset_k < model.action_horizon):
+        raise ValueError(
+            f"aux_loss_offset_k ({config.openpi.aux_loss_offset_k}) must be strictly between 0 "
+            f"and action_horizon ({model.action_horizon}) -- train_step slices "
+            f"actions[:, :aux_loss_offset_k, :] out of the real action_horizon window, and the "
+            f"offset must leave at least one future frame within the episode's action horizon."
+        )
+    aux_loss_offset_k = config.openpi.aux_loss_offset_k if config.openpi.aux_loss_weight > 0 else None
     return dataclasses.replace(
         base,
         project_name=config.openpi.project_name,
         exp_name=config.openpi.exp_name,
         model=model,
-        data=_overlay_data(base.data, config.data),
+        data=_overlay_data(base.data, config.data, aux_loss_offset_k=aux_loss_offset_k),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             config.openpi.initialization_checkpoint
         ),

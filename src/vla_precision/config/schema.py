@@ -272,6 +272,15 @@ class Stage1OpenPIConfig:
     lr_schedule: OpenPILRScheduleConfig = field(default_factory=OpenPILRScheduleConfig)
     optimizer: OpenPIOptimizerConfig = field(default_factory=OpenPIOptimizerConfig)
     ema_decay: float | None = 0.999
+    # WAM-style auxiliary future-prediction loss (see docs/wam-aux-loss.md). 0.0 = disabled
+    # (byte-identical to stock training); the EMA target encoder this loss needs is ema_decay
+    # above, already required to be non-None whenever aux_loss_weight > 0.
+    aux_loss_weight: float = 0.0
+    aux_loss_offset_k: int = 8  # frames ahead the auxiliary loss predicts; unused if aux_loss_weight == 0.0
+    # The aux predictor's own Adam learning rate (aux_probe_predictor.py's validated Phase 0
+    # value) -- a separate optimizer from lr_schedule above, since the predictor is not part of
+    # Pi0's own trainable_filter. Unused if aux_loss_weight == 0.0.
+    aux_learning_rate: float = 1e-3
     log_interval: int = 100
     save_interval: int = 10_000
     keep_period: int | None = 5_000
