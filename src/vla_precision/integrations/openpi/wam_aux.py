@@ -9,18 +9,16 @@ bidirectional self-attention stack (SigLIP/PaliGemma's vision tower), and alread
 two forms: "online" (the live, being-trained params) and "EMA-stabilized" (the model reconstructed
 from `state.ema_params`, openpi's own existing checkpoint-quality EMA machinery, reused here as
 the BYOL/JEPA-style target encoder). So this module ports only the parts Pi0 doesn't already
-supply: the predictor itself (a learned positional query per output position, refined by
-cross-attention blocks conditioned on flow-matching time / offset k / the action window t..t+k),
-its own GRU action-sequence encoder, and one small EMA-lagged down-projection (see
-`AuxProjection` below) -- the one new, freshly-initialized layer in this whole design, and
-therefore the one place a fresh EMA lag is actually needed to preserve the asymmetry a
-self-predictive loss requires to avoid collapsing to a constant.
+supply: the predictor itself (a per-position query seeded from the context, refined by
+cross-attention blocks conditioned on the offset k and the action window t..t+k), its own GRU
+action-sequence encoder, and one small EMA-lagged down-projection (see `AuxProjection` below) --
+the one new, freshly-initialized layer in this whole design, and therefore the one place a fresh
+EMA lag is actually needed to preserve the asymmetry a self-predictive loss requires to avoid
+collapsing to a constant.
 
-Flow-matching noise/time convention is ported byte-for-byte from the validated Phase 0 code
-(uniform tau in [0, 1], `noised = (1 - tau) * noise + tau * target`, velocity target
-`target - noise`) rather than pi0.5's own Beta(1.5, 1) convention -- the two aren't the same
-mechanism despite the plan doc's original aspiration to match pi0.5's; this ports what was
-actually trained and validated on real data, not the earlier aspiration.
+The loss is mean per-token cosine distance against the EMA-encoded future. An earlier version
+wrapped it in flow matching instead, ported from Phase 0; `compute_aux_loss` records why that was
+replaced and what it cost to find out.
 """
 
 from __future__ import annotations
@@ -370,7 +368,7 @@ def compute_aux_loss(
     representation scale, and it reads on an interpretable range: 0 is perfect, ~1.0 is
     uncorrelated.
 
-    Returns (per-example loss, per-example copy baseline), both (batch,)."""
+    Returns (per-example loss, per-example copy baseline, scalar collapse metric)."""
     # TOKEN_DIM/NUM_TOKENS are properties of the checkpoint (gemma_2b's width, SigLIP-224's
     # per-camera token count), not of this module -- a different paligemma_variant or image
     # resolution would otherwise fail deep inside AuxProjection's dot_general or
@@ -395,7 +393,16 @@ def compute_aux_loss(
     per_token = 1.0 - _cosine_similarity(prediction, target)
     # The copy baseline: what "the future just looks like the present" already scores. Logged
     # alongside the loss because the loss alone cannot say whether the predictor is doing anything
-    # the identity map would not -- at k=8 (0.27s at 30Hz) the two frames are very close, and a
-    # near-identity solution would otherwise look like success.
+    # the identity map would not -- at small k the two frames are very close (measured: 0.016 at
+    # k=8, i.e. 98.4% cosine-similar before any training at all), and a near-identity solution
+    # would otherwise look like success.
     copy_baseline = 1.0 - _cosine_similarity(context, target)
-    return jnp.mean(per_token, axis=-1), jnp.mean(copy_baseline, axis=-1)
+    # Collapse detector. The cheapest way to satisfy a self-predictive loss is to stop encoding
+    # change -- if every token maps to the same direction, present and future match trivially and
+    # the policy loses its ability to perceive motion. For L2-normalized targets the mean vector's
+    # norm is ~1 when they all point the same way and ~0 when they are well spread, so this reads
+    # as: 0 = healthy spread, 1 = fully collapsed. It is a property of the TARGET only, so unlike
+    # copy_baseline it does not move just because the predictor improved.
+    normalized = target * jax.lax.rsqrt(jnp.sum(jnp.square(target), axis=-1, keepdims=True) + 1e-8)
+    collapse = jnp.linalg.norm(jnp.mean(normalized, axis=(-3, -2)), axis=-1)
+    return jnp.mean(per_token, axis=-1), jnp.mean(copy_baseline, axis=-1), collapse

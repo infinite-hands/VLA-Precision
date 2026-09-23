@@ -264,7 +264,7 @@ def train_step_with_aux(
         target_model = nnx.merge(state.model_def, state.ema_params)
         target_tokens_raw, _, _ = target_model.embed_prefix(future_obs)
 
-        per_example_aux, per_example_copy = wam_aux.compute_aux_loss(
+        per_example_aux, per_example_copy, aux_collapse = wam_aux.compute_aux_loss(
             projection,
             predictor,
             aux_state.projection_ema,
@@ -276,14 +276,14 @@ def train_step_with_aux(
         )
         aux_loss = jnp.mean(per_example_aux)
         total_loss = primary_loss + aux_loss_weight * aux_loss
-        return total_loss, (primary_loss, aux_loss, jnp.mean(per_example_copy))
+        return total_loss, (primary_loss, aux_loss, jnp.mean(per_example_copy), aux_collapse)
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions, aux_future_image = batch
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
     argnums = (diff_state, nnx.DiffState(1, nnx.All(nnx.Param)), nnx.DiffState(2, nnx.All(nnx.Param)))
-    (loss, (primary_loss, aux_loss, aux_copy_baseline)), (grads, grads_projection, grads_predictor) = (
+    (loss, (primary_loss, aux_loss, aux_copy_baseline, aux_collapse)), (grads, grads_projection, grads_predictor) = (
         nnx.value_and_grad(loss_fn, argnums=argnums, has_aux=True)(
             model, projection, predictor, train_rng, observation, actions, aux_future_image
         )
@@ -296,6 +296,9 @@ def train_step_with_aux(
     # What "the future looks just like the present" already scores. aux_loss meaningfully below
     # this is the only evidence the predictor is doing something an identity map would not.
     info["aux_copy_baseline"] = aux_copy_baseline
+    # 0 = target directions well spread, 1 = collapsed to a single direction (the degenerate
+    # solution where the representation stops encoding change so now and future trivially match).
+    info["aux_collapse"] = aux_collapse
     return new_state, new_aux_state, info
 
 
