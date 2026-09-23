@@ -41,6 +41,14 @@ class DualURInputs(transforms.DataTransformFn):
     # Do not change this for your own dataset.
     model_type: _model.ModelType
 
+    # Which of the three image slots are real (True) vs padding/absent (False), by openpi key.
+    # None (the default) marks every slot real, which is IDENTICAL to this class's original
+    # behavior for every config that does not set it. Applied to BOTH train and infer, since this
+    # transform runs on both -- a single-arm config that only has a meaningful wrist view sets this
+    # once and both stages agree, rather than a train-time dataset choice and a separate serve-time
+    # one that could silently drift apart.
+    active_image_keys: frozenset[str] | None = None
+
     def __call__(self, data: dict) -> dict:
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference.
@@ -51,26 +59,26 @@ class DualURInputs(transforms.DataTransformFn):
         # and two wrist views (left and right). If your dataset does not have a particular type
         # of image, e.g. wrist images, you can comment it out here and replace it with zeros like we do for the
         # right wrist image below.
-        exterior_image = _parse_image(data["observation/exterior_image"])
-        left_wrist_image = _parse_image(data["observation/left_wrist_image"])
-        right_wrist_image = _parse_image(data["observation/right_wrist_image"])
+        raw_images = {
+            "base_0_rgb": _parse_image(data["observation/exterior_image"]),
+            "left_wrist_0_rgb": _parse_image(data["observation/left_wrist_image"]),
+            "right_wrist_0_rgb": _parse_image(data["observation/right_wrist_image"]),
+        }
+
+        def is_active(key: str) -> bool:
+            return self.active_image_keys is None or key in self.active_image_keys
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
             "state": data["observation/state"],
+            # Masked-out slots are ALSO zeroed, not just flagged in image_mask below -- belt and
+            # braces against a real image leaking signal through some path that does not honor the
+            # mask. Pad any non-existent images with zero-arrays of the appropriate shape.
             "image": {
-                "base_0_rgb": exterior_image,
-                "left_wrist_0_rgb": left_wrist_image,
-                # Pad any non-existent images with zero-arrays of the appropriate shape.
-                "right_wrist_0_rgb": right_wrist_image,
+                key: (image if is_active(key) else np.zeros_like(image))
+                for key, image in raw_images.items()
             },
-            "image_mask": {
-                "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
-                # We only mask padding images for pi0 model, not pi0-FAST. Do not change this for your own dataset.
-                # This is a real camera in dual-arm mode, never padding.
-                "right_wrist_0_rgb": np.True_,
-            },
+            "image_mask": {key: np.bool_(is_active(key)) for key in raw_images},
         }
 
         # Pad actions to the model action dimension. Keep this for your own dataset.

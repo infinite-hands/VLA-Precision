@@ -223,6 +223,10 @@ class Stage1DataConfig:
     extra_delta_transform: bool = False
     prompt_from_task: bool = True
     image_key_map: dict[str, str] = field(default_factory=dict)
+    # Empty (default): every image slot is real, an exact no-op for every existing config. A
+    # non-empty tuple names the openpi image keys to actually use; the rest are masked AND zeroed,
+    # on both train and infer -- see DualURInputs.active_image_keys.
+    active_image_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

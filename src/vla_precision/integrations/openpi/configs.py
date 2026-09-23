@@ -169,6 +169,7 @@ def _overlay_data(base, data):
         action_key=data.action_key,
         image_key_map=dict(data.image_key_map),
         extra_delta_transform=data.extra_delta_transform,
+        active_image_keys=tuple(data.active_image_keys) or None,
     )
 
 

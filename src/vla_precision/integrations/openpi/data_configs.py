@@ -95,6 +95,11 @@ class LeRobotDualUR5eDataConfig(openpi_config.DataConfigFactory):
     state_key: str = "observation.state"
     action_key: str = "action"
     image_key_map: dict[str, str] | None = None
+    # None (default): every image slot is real, identical to this class's original behavior.
+    # A non-None set names the openpi image keys ("base_0_rgb", "left_wrist_0_rgb",
+    # "right_wrist_0_rgb") that should actually be used; the rest are masked AND zeroed by
+    # DualURInputs, on both train and infer.
+    active_image_keys: tuple[str, ...] | None = None
 
     @override
     def create(
@@ -123,7 +128,10 @@ class LeRobotDualUR5eDataConfig(openpi_config.DataConfigFactory):
             ]
         )
         data_transforms = transforms.Group(
-            inputs=[dual_ur.DualURInputs(model_type=model_config.model_type)],
+            inputs=[dual_ur.DualURInputs(
+                model_type=model_config.model_type,
+                active_image_keys=None if self.active_image_keys is None else frozenset(self.active_image_keys),
+            )],
             outputs=[dual_ur.DualUROutputs()],
         )
         if self.extra_delta_transform:
