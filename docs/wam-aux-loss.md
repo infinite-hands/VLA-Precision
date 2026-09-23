@@ -150,6 +150,29 @@ the degenerate solution where the representation stops encoding change altogethe
 cannot attribute that on its own, since it also moves when the predictor improves or the shared
 projection adapts, which is why `aux_collapse` (a property of the target directions only) exists.
 
+## Measured behaviour (500 steps, k=29, aux_loss_weight=0.05)
+
+First configuration where every instrument reads honestly at once:
+
+| metric | step 0 | step 490 |
+|---|---|---|
+| `aux_copy_baseline` | 0.450 | 0.393 |
+| `aux_loss` | 0.994 | 0.163 |
+| `aux_collapse` | 0.048 | 0.046 |
+| `primary_loss` | 0.108 | 0.138 (same band throughout) |
+
+The predictor ends ~2.4x better than the copy baseline, so it is learning dynamics rather than the
+identity map; the target representation does not collapse; and the primary action loss is
+unaffected. `grad_norm` stays in 0.15-0.99 with no spikes.
+
+Caveats worth keeping attached to those numbers. `aux_loss` plateaus near 0.17 from about step 140
+and stops improving, while `copy_baseline` drifts slightly upward, so the ~2.3x ratio is stable
+rather than growing. 500 steps says nothing about long-horizon behaviour. `aux_loss_weight=0.05`
+remains an arbitrary constant (JEPA-WAM publishes 0.1 with a 1K-step linear warmup for the
+pretrained-pi0.5 case). And none of this measures the actual goal: whether the auxiliary loss
+improves grasp generalization. That needs a full run plus an eval against a matched
+`aux_loss_weight=0.0` control, which is the obvious next experiment.
+
 ## Separate optimizer state
 
 The predictor + projection have their **own** Adam optimizer (`wam_aux.AuxState`,
