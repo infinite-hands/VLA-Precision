@@ -41,16 +41,14 @@ structure that's already latent in its own representations."
 
 Ported from the offline probe's validated design (`aux_probe_predictor.py`):
 
-- A **learned positional query** per output token (`query_pos_embed`), added to the current
-  flow-matching noise estimate — refined by cross-attention to context, not a content-free mask
-  token, since this operates on a noised continuous value (flow-matching), not a masked-prediction
-  scheme.
+- A **per-position query**, seeded from the context at that position plus a learned positional
+  embedding (`query = context + query_pos_embed`), so the predictor's job is to predict the CHANGE
+  from present to future. Content-free queries do not work here — see "Why not flow matching".
 - Per predictor block (`wam_aux._CrossAttnPredictorBlock`): bidirectional self-attention among the
   query tokens, then cross-attention to the context tokens as K/V — both **adaLN-zero** conditioned
-  on (flow-matching time `tau`, prediction offset `k`, the action window `t..t+k`). adaLN-zero
-  means every block starts as an exact identity map (all gates initialize to zero); gradient only
-  starts reaching upstream of the predictor (into the projection / backbone) after the first
-  optimizer step turns the gates on — this is expected, not a bug.
+  on (prediction offset `k`, the action window `t..t+k`). adaLN-zero means every block starts as an
+  exact identity map (all gates initialize to zero); gradient only starts reaching upstream of the
+  predictor after the first optimizer step turns the gates on — this is expected, not a bug.
 - The action window is encoded by a GRU (`wam_aux._ActionSequenceEncoder`) over `actions[:,
   :aux_loss_offset_k, :]` — order-aware, unlike a mean-pool over the window.
 - The loss is **mean per-token cosine distance**, `1 - cos(prediction, stopgrad(target))`, computed
@@ -60,9 +58,14 @@ Ported from the offline probe's validated design (`aux_probe_predictor.py`):
   prediction in flow matching instead — see "Why not flow matching" below.
 - Each query is seeded from the context at its own position (`query = context + query_pos_embed`),
   so the predictor's job is to predict the CHANGE from present to future.
-- `copy_baseline` (`1 - cos(context, target)`) is logged every step next to the loss. It is what
-  "the future just looks like the present" already scores, and it is the only way to tell a
-  predictor that learned something from one that learned the identity map.
+- Both sides are **population-centered** (`wam_aux._center`) before any similarity is taken.
+  PaliGemma embeddings are strongly anisotropic; without this, cosine saturates and every
+  instrument built on it reads garbage. See "Why the representation is centered".
+- `copy_baseline` (`1 - cos(context, target)`) and `aux_collapse` are logged every step next to the
+  loss. The first is what "the future just looks like the present" already scores — the only way to
+  tell a predictor that learned something from one that learned the identity map. The second is the
+  norm of the mean unit target, detecting the degenerate solution where the representation stops
+  encoding change so present and future match trivially.
 
 ## Why not flow matching (a real bug this caught)
 
@@ -149,6 +152,27 @@ Also watch `aux_collapse` alongside it. On that same k=8 run `copy_baseline` *fe
 the degenerate solution where the representation stops encoding change altogether. `copy_baseline`
 cannot attribute that on its own, since it also moves when the predictor improves or the shared
 projection adapts, which is why `aux_collapse` (a property of the target directions only) exists.
+
+## Why the representation is centered (a third real bug this caught)
+
+Transformer embeddings occupy a narrow cone rather than the full sphere. Measured here: the
+collapse metric read **0.972 at step 0, before any training**, meaning the shared direction accounts
+for ~97% of a typical unit vector. Every pair of PaliGemma embeddings is therefore ~97%
+cosine-similar regardless of content, which saturated every instrument built on cosine.
+
+This produced a wrong conclusion that survived two runs: `copy_baseline` read 0.016 at k=8 and only
+0.026 at k=29, which I read as "the future looks like the present, so the task is trivial and the
+horizon is too short". It was not. Quadrupling the horizon from 0.27s to ~1s could not show up
+because *everything* is similar to everything inside that cone.
+
+Note `_standardize` does **not** address this — it removes each token's own mean along the feature
+axis, which leaves the shared cross-token direction entirely intact. `_center` removes the
+population mean direction over (batch, tokens).
+
+Verified against synthetic embeddings carrying a large shared direction reproducing the measured
+anisotropy: blind-vs-informative separation is 0.867 anisotropic against 0.874 isotropic, i.e. the
+objective becomes essentially immune. On real data, centering moved `copy_baseline` from 0.026 to
+0.39 and `aux_collapse` from 0.97 to 0.05 — both instruments became informative for the first time.
 
 ## Measured behaviour (500 steps, k=29, aux_loss_weight=0.05)
 
