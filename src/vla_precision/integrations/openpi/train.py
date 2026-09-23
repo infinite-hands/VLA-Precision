@@ -30,7 +30,9 @@ from openpi.training import sharding
 import wandb
 from vla_precision.config import ResolvedStage1Config
 from vla_precision.integrations.openpi import data_loader as _data_loader
+from vla_precision.integrations.openpi import wam_aux
 from vla_precision.integrations.openpi.configs import build_stage1_train_config
+from vla_precision.integrations.openpi.policies.dual_ur import RIGHT_WRIST_CAMERA_KEY as _AUX_CAMERA_KEY
 
 LOGGER = logging.getLogger(__name__)
 
@@ -131,30 +133,17 @@ def init_train_state(
     return train_state, state_sharding
 
 
-@at.typecheck
-def train_step(
+def _apply_model_update(
     config: _config.TrainConfig,
-    rng: at.KeyArrayLike,
+    model: _model.BaseModel,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    grads: nnx.State,
+    loss: at.Array,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
-    model = nnx.merge(state.model_def, state.params)
-    model.train()
-
-    @at.typecheck
-    def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
-
-    train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
-
-    # Filter out frozen params.
-    diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
-
+    """The optimizer-step + EMA-update + info-dict tail shared by `train_step` and
+    `train_step_with_aux`. Extracted so the two step functions cannot silently drift apart --
+    before this, the tail was duplicated line-for-line, and the aux path's own docstring claim of
+    being "identical to train_step except..." had nothing enforcing it."""
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
@@ -187,6 +176,123 @@ def train_step(
         "param_norm": optax.global_norm(kernel_params),
     }
     return new_state, info
+
+
+@at.typecheck
+def train_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    @at.typecheck
+    def loss_fn(
+        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+    ):
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        return jnp.mean(chunked_loss)
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions = batch
+
+    # Filter out frozen params.
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+
+    return _apply_model_update(config, model, state, grads, loss)
+
+
+@at.typecheck
+def train_step_with_aux(
+    config: _config.TrainConfig,
+    aux_loss_weight: float,
+    aux_loss_offset_k: int,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    aux_state: wam_aux.AuxState,
+    batch: tuple[_model.Observation, _model.Actions, at.Float[at.Array, "*b h w c"]],
+) -> tuple[training_utils.TrainState, wam_aux.AuxState, dict[str, at.Array]]:
+    """WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md): identical to `train_step`
+    except it also differentiates a combined (primary + aux_loss_weight * aux) loss w.r.t. the aux
+    predictor's own parameters, and steps those via their own separate optimizer (`wam_aux.
+    apply_aux_update`) instead of growing Pi0's own trainable_filter. Only called when
+    `config.openpi.aux_loss_weight > 0`; `train_step` above is untouched and remains exactly what
+    every non-aux run uses, so this function existing changes nothing about stock training."""
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+    projection = nnx.merge(aux_state.projection_graphdef, aux_state.projection_params)
+    predictor = nnx.merge(aux_state.predictor_graphdef, aux_state.predictor_params)
+
+    @at.typecheck
+    def loss_fn(
+        model: _model.BaseModel,
+        projection: wam_aux.AuxProjection,
+        predictor: wam_aux.AuxFuturePredictor,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        aux_future_image: at.Array,
+    ):
+        primary_rng, aux_rng = jax.random.split(rng)
+        primary_loss = jnp.mean(model.compute_loss(primary_rng, observation, actions, train=True))
+
+        # Minimal single-camera Observations -- embed_prefix() never reads `.state` (confirmed
+        # against the pinned openpi source), so the SAME real `observation.state` is reused for
+        # both; only the image differs. This keeps embed_prefix()'s per-camera loop from ever
+        # seeing more than the one camera this loss targets, so it cannot leak the future frame
+        # into the model's actual perception of "now" via the primary loss's own forward pass
+        # above (which used the original, unmodified `observation`).
+        now_obs = _model.Observation(
+            images={_AUX_CAMERA_KEY: observation.images[_AUX_CAMERA_KEY]},
+            image_masks={_AUX_CAMERA_KEY: observation.image_masks[_AUX_CAMERA_KEY]},
+            state=observation.state,
+        )
+        future_obs = _model.Observation(
+            images={_AUX_CAMERA_KEY: aux_future_image},
+            image_masks={_AUX_CAMERA_KEY: observation.image_masks[_AUX_CAMERA_KEY]},
+            state=observation.state,
+        )
+        context_tokens, _, _ = model.embed_prefix(now_obs)
+        # openpi's own existing checkpoint-quality EMA, reused as the BYOL/JEPA-style target
+        # encoder: `state.ema_params` is never part of this function's diffed argnums, so the
+        # future frame's embedding is detached from the gradient tape by construction (and
+        # wrapped in an explicit jax.lax.stop_gradient a second time inside compute_aux_loss,
+        # BYOL-standard belt-and-suspenders).
+        target_model = nnx.merge(state.model_def, state.ema_params)
+        target_tokens_raw, _, _ = target_model.embed_prefix(future_obs)
+
+        aux_loss = jnp.mean(
+            wam_aux.compute_aux_loss(
+                projection,
+                predictor,
+                aux_state.projection_ema,
+                aux_rng,
+                context_tokens=context_tokens,
+                target_tokens_raw=target_tokens_raw,
+                offset_k=aux_loss_offset_k,
+                action_window=actions[:, :aux_loss_offset_k, :],
+            )
+        )
+        total_loss = primary_loss + aux_loss_weight * aux_loss
+        return total_loss, (primary_loss, aux_loss)
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions, aux_future_image = batch
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    argnums = (diff_state, nnx.DiffState(1, nnx.All(nnx.Param)), nnx.DiffState(2, nnx.All(nnx.Param)))
+    (loss, (primary_loss, aux_loss)), (grads, grads_projection, grads_predictor) = nnx.value_and_grad(
+        loss_fn, argnums=argnums, has_aux=True
+    )(model, projection, predictor, train_rng, observation, actions, aux_future_image)
+
+    new_state, info = _apply_model_update(config, model, state, grads, loss)
+    new_aux_state = wam_aux.apply_aux_update(aux_state, grads_projection, grads_predictor)
+    info["primary_loss"] = primary_loss
+    info["aux_loss"] = aux_loss
+    return new_state, new_aux_state, info
 
 
 def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
@@ -246,12 +352,38 @@ def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
+    # WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md): decided once, statically,
+    # before any jit tracing -- everything below this point either builds the exact stock jit'd
+    # step (aux disabled, byte-identical to a build of this file without wam_aux.py at all) or the
+    # aux-aware one, never a mix. aux_state is NOT threaded through checkpoint save/restore yet
+    # (a known, deliberate gap -- see docs/wam-aux-loss.md): resuming a run restarts the aux
+    # predictor and its optimizer from scratch even though `train_state` itself resumes correctly.
+    aux_enabled = resolved.config.openpi.aux_loss_weight > 0
+    if aux_enabled:
+        aux_state = wam_aux.init_aux_state(
+            action_dim=config.model.action_dim,
+            learning_rate=resolved.config.openpi.aux_learning_rate,
+            rngs=nnx.Rngs(jax.random.fold_in(init_rng, 0x4157)),
+        )
+        ptrain_step_aux = jax.jit(
+            functools.partial(
+                train_step_with_aux,
+                config,
+                resolved.config.openpi.aux_loss_weight,
+                resolved.config.openpi.aux_loss_offset_k,
+            ),
+            in_shardings=(replicated_sharding, train_state_sharding, replicated_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding, replicated_sharding),
+            donate_argnums=(1, 2),
+        )
+    else:
+        aux_state = None
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -264,7 +396,10 @@ def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+            if aux_enabled:
+                train_state, aux_state, info = ptrain_step_aux(train_rng, train_state, aux_state, batch)
+            else:
+                train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
