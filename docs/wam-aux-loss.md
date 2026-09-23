@@ -53,15 +53,52 @@ Ported from the offline probe's validated design (`aux_probe_predictor.py`):
   optimizer step turns the gates on — this is expected, not a bug.
 - The action window is encoded by a GRU (`wam_aux._ActionSequenceEncoder`) over `actions[:,
   :aux_loss_offset_k, :]` — order-aware, unlike a mean-pool over the window.
-- Flow-matching happens entirely in the projection's `d_model` space, not the raw 2048-dim token
-  space (cheaper, and matches what was validated offline): uniform `tau ∈ [0, 1]`,
-  `noised = (1 - tau) * noise + tau * target`, velocity target `target - noise`. This is ported
-  byte-for-byte from the validated offline code, not pi0.5's own Beta(1.5, 1) time-sampling
-  convention — the two aren't the same mechanism.
-- Both `context` and `target` are standardized per token (`wam_aux._standardize`, a LayerNorm with
-  no learnable parameters) before the loss. This is load-bearing, not cosmetic — see below.
+- The loss is **mean per-token cosine distance**, `1 - cos(prediction, stopgrad(target))`, computed
+  in the projection's `d_model` space. This is what JEPA-WAM (arXiv 2608.09381) uses for this exact
+  objective on this exact base model, and direct regression is what the whole I-JEPA/V-JEPA family
+  uses (I-JEPA L2; V-JEPA and V-JEPA 2 L1 on LayerNormed targets). An earlier version wrapped the
+  prediction in flow matching instead — see "Why not flow matching" below.
+- Each query is seeded from the context at its own position (`query = context + query_pos_embed`),
+  so the predictor's job is to predict the CHANGE from present to future.
+- `copy_baseline` (`1 - cos(context, target)`) is logged every step next to the loss. It is what
+  "the future just looks like the present" already scores, and it is the only way to tell a
+  predictor that learned something from one that learned the identity map.
 
-## Why the target is normalized (a real bug this caught)
+## Why not flow matching (a real bug this caught)
+
+The first formulation noised the target and regressed a flow-matching velocity, ported from the
+offline Phase 0 probe on the theory that it would avoid regressing to the mean on a multimodal
+future. On a real 500-step run it fell to ~1.03 within 30 steps and then sat there, and the number
+turned out to be uninterpretable:
+
+- "Estimate the target, treat the noise as unpredictable" is an attractor pinned at exactly `1 + s`
+  for unexplained target variance `s`. A loss of 1.043 was consistent with `s ≈ 0.44` OR `s ≈ 0.043`
+  depending on whether the predictor used the noised input at all — a 10x ambiguity in the only
+  quantity that mattered.
+- 2.0 was never the "no information" baseline either. A predictor that reads `x_tau` and knows
+  nothing about the future already scores `∫₀¹ dτ/((1-τ)² + τ²) = π/2 ≈ 1.571`, so a large part of
+  the apparent progress was arithmetic available at initialization.
+- A control on synthetic data with a known-predictable future settled it: informative context scored
+  **1.664** against **1.651** for context carrying NO information. The objective was not using the
+  context at all, while still looking converged.
+
+Latent prediction already solves the multimodality problem the flow wrapper was added for — the
+encoder is free to drop unpredictable content, which is JEPA's founding argument — and nothing here
+ever samples from the flow, so the machinery bought only a pedestal that hid the signal. The same
+control on the cosine objective separates cleanly: 0.994 blind, 0.118 informative, 0.017 oracle.
+
+One non-obvious thing the switch broke, worth recording because it cost real debugging. With
+content-free queries (V-JEPA's mask-token style), context can only reach the output through
+cross-attention — and at init the softmax is near-uniform, so every output position receives the
+same pooled summary and scores cosine ~0 against its own target. Escaping that requires first
+learning a near-one-hot "attend to myself" pattern. Measured on the oracle task, content-free
+queries sat at 0.99 for 800 steps while a bare per-position linear readout reached 0.0005. Neither
+the loss nor the adaLN-zero warm start was at fault (both were eliminated by bisection); the
+routing was. Seeding the query from the context at the same position fixes it, which is also
+effectively what the old flow version was doing by seeding each query with a noised sample of its
+own target.
+
+## Why the representation is normalized (another real bug this caught)
 
 The first 500-step validation run looked healthy for ~40 steps and then went wrong: `aux_loss` fell
 16.9 → 2.2, then climbed monotonically back to 15.1 over the remaining ~450 steps, while the

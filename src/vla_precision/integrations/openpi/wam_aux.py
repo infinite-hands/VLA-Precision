@@ -116,6 +116,13 @@ def _standardize(x: jax.Array) -> jax.Array:
     return (x - mean) * jax.lax.rsqrt(variance + 1e-6)
 
 
+def _cosine_similarity(a: jax.Array, b: jax.Array) -> jax.Array:
+    """Per-token cosine similarity along the feature axis, returning (..., num_tokens)."""
+    a_norm = a * jax.lax.rsqrt(jnp.sum(jnp.square(a), axis=-1, keepdims=True) + 1e-8)
+    b_norm = b * jax.lax.rsqrt(jnp.sum(jnp.square(b), axis=-1, keepdims=True) + 1e-8)
+    return jnp.sum(a_norm * b_norm, axis=-1)
+
+
 def _adaln_zero_linear(cond_dim: int, out_dim: int, *, rngs: nnx.Rngs) -> nnx.Linear:
     """A Linear whose output starts at exactly zero (adaLN-zero) so every predictor block begins
     training as an identity residual and only gradually turns on -- ported from
@@ -179,11 +186,14 @@ class _ActionSequenceEncoder(nnx.Module):
 
 
 class AuxFuturePredictor(nnx.Module):
-    """context (z_t, online projection) + a learned positional query per output position, carrying
-    the current flow-matching noise estimate -- refined by `_CrossAttnPredictorBlock`s conditioned
-    on (k, tau, action-window) into a predicted velocity, in `AuxProjection`'s d_model space (not
-    the raw 2048-dim token space -- cheaper, and matches what Phase 0 validated: flow-matching in
-    a learned, lower-dim representation, not the raw token width)."""
+    """context (z_t, online projection) + a content-free learned positional query per output
+    position, refined by `_CrossAttnPredictorBlock`s conditioned on (k, action-window) into a
+    DIRECT prediction of the future embedding, in `AuxProjection`'s d_model space.
+
+    The queries carry no content: each output position asks the context what it should become,
+    which is exactly I-JEPA/V-JEPA's mask-token formulation. An earlier version instead seeded each
+    query with a noised sample of the target and predicted a flow-matching velocity; see
+    `compute_aux_loss` for why that was removed."""
 
     def __init__(
         self,
@@ -198,29 +208,44 @@ class AuxFuturePredictor(nnx.Module):
     ):
         self.d_model = d_model
         self.query_pos_embed = nnx.Param(nnx.initializers.normal(0.02)(rngs.params(), (1, num_tokens, d_model)))
+        # Position must be identifiable on the CONTEXT side too, not just the query side. The
+        # queries are content-free (V-JEPA's mask-token formulation), so the query for output
+        # position i has to locate context token i among all 256 by cross-attention -- and it
+        # cannot match on content, because the content is exactly what it is trying to predict.
+        # Without this, cross-attention has no positional handle to match on and the predictor
+        # cannot even solve the oracle task (measured: loss stuck at 0.98-0.99 for 1500 steps with
+        # context set to the literal answer). An earlier flow-matching version accidentally avoided
+        # this by seeding each query with a noised sample of its own target, which anchored it.
+        self.context_pos_embed = nnx.Param(nnx.initializers.normal(0.02)(rngs.params(), (1, num_tokens, d_model)))
         self.action_encoder = _ActionSequenceEncoder(action_dim, d_model, rngs=rngs)
         self.condition_mlp_in = nnx.Linear(d_model, d_model, rngs=rngs)
         self.condition_mlp_out = nnx.Linear(d_model, d_model, rngs=rngs)
         self.blocks = [_CrossAttnPredictorBlock(d_model, d_model, heads, mlp_ratio, rngs=rngs) for _ in range(depth)]
         self.out_norm = nnx.LayerNorm(d_model, use_bias=False, use_scale=False, epsilon=1e-6, rngs=rngs)
-        self.out = nnx.Linear(
-            d_model, d_model, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros, rngs=rngs
-        )
+        # NOT zero-initialized, unlike the adaLN gates: the loss is a cosine, and an exactly-zero
+        # prediction has no direction, so its cosine against the target is 0/0. The adaLN-zero
+        # gates still make every block an identity at init, so the warm start is unchanged -- the
+        # prediction simply begins as a fixed function of the positional queries, which is
+        # uncorrelated with the target and therefore reads as the loss's natural 1.0 baseline.
+        self.out = nnx.Linear(d_model, d_model, rngs=rngs)
 
-    def __call__(
-        self,
-        context: jax.Array,
-        noised_future: jax.Array,
-        *,
-        tau: jax.Array,
-        k: jax.Array,
-        actions: jax.Array,
-    ) -> jax.Array:
-        query = noised_future + self.query_pos_embed
+    def __call__(self, context: jax.Array, *, k: jax.Array, actions: jax.Array) -> jax.Array:
+        # Seeded from the context at the SAME position, not a content-free constant. Cross-attention
+        # alone cannot carry position: at init the softmax is near-uniform, so every output position
+        # receives the same pooled summary of the context and scores cosine ~0 against its own
+        # target, and escaping that requires learning a near-one-hot "attend to myself" pattern
+        # first. Measured on the oracle task (context = the literal answer), content-free queries
+        # stayed at 0.99 for 800 steps while a bare per-position linear readout reached 0.0005 --
+        # the routing, not the objective, was the bottleneck. Seeding this way also makes the
+        # predictor's job the natural one: predict the CHANGE from present to future. That does
+        # make the identity map an easy solution, which is exactly what `copy_baseline` in
+        # compute_aux_loss measures, so a predictor that only learns to copy is visible rather than
+        # mistaken for success.
+        query = context + self.query_pos_embed
+        context = context + self.context_pos_embed
         action_emb = self.action_encoder(actions)
         k_emb = _timestep_embedding(k.astype(jnp.float32), self.d_model)
-        tau_emb = _timestep_embedding(tau, self.d_model)
-        condition = self.condition_mlp_out(nnx.silu(self.condition_mlp_in(action_emb + k_emb + tau_emb)))
+        condition = self.condition_mlp_out(nnx.silu(self.condition_mlp_in(action_emb + k_emb)))
         for block in self.blocks:
             query = block(query, context, condition)
         return self.out(self.out_norm(query))
@@ -314,17 +339,38 @@ def compute_aux_loss(
     target_tokens_raw: jax.Array,
     offset_k: int,
     action_window: jax.Array,
-) -> jax.Array:
-    """WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md). `context_tokens` /
-    `target_tokens_raw` are Pi0.embed_prefix's raw (batch, 256, 2048) right-wrist output -- the
-    former from the online model, the latter from `nnx.merge(state.model_def, state.ema_params)`,
-    i.e. already detached from the diffed argnum by construction (ema_params is never part of
-    `nnx.value_and_grad`'s differentiated state). `target_tokens_raw` is additionally wrapped in
-    `jax.lax.stop_gradient` below as defensive, BYOL-standard belt-and-suspenders, matching
-    aux_probe_predictor.py's `@torch.no_grad()`-wrapped `target_representation`.
+) -> tuple[jax.Array, jax.Array]:
+    """WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md): mean per-token cosine
+    distance between the predicted and the EMA-encoded future embedding, which is what JEPA-WAM
+    (arXiv 2608.09381) uses for exactly this objective on exactly this base model (pi0.5), and
+    what the whole I-JEPA/V-JEPA family uses in direct-regression form.
 
-    Returns a per-example loss (batch,), matching Pi0.compute_loss's own per-example convention
-    (mean over the trailing feature axis; the caller takes the batch mean)."""
+    `context_tokens` / `target_tokens_raw` are Pi0.embed_prefix's raw (batch, 256, 2048)
+    right-wrist output -- the former from the online model, the latter from
+    `nnx.merge(state.model_def, state.ema_params)`, i.e. already detached from the diffed argnum by
+    construction (ema_params is never part of `nnx.value_and_grad`'s differentiated state).
+    `target_tokens_raw` is additionally wrapped in `jax.lax.stop_gradient` below as defensive,
+    BYOL-standard belt-and-suspenders.
+
+    This REPLACED a flow-matching formulation (noise the target, regress a velocity), which was
+    ported from the offline Phase 0 probe on the theory that it would avoid regressing to the mean
+    on a multimodal future. Measured on a real 500-step run, that objective was uninterpretable:
+    it fell to ~1.03 within 30 steps and sat there, because "estimate the target, treat the noise
+    as unpredictable" is an attractor pinned at exactly 1 + s for unexplained target variance s.
+    A loss of 1.043 was consistent with s ~ 0.44 OR s ~ 0.043 depending on whether the predictor
+    used the noised input at all -- a 10x ambiguity in the only quantity that mattered. A control
+    on synthetic data with a known-predictable future confirmed the failure mode: informative
+    context scored 1.664 against 1.651 for context carrying NO information, i.e. the objective was
+    not using the context at all while still looking converged. Latent prediction already solves
+    the multimodality problem the flow wrapper was added for -- the encoder is free to drop
+    unpredictable content -- and nothing here ever samples from the flow, so its machinery bought
+    only a pedestal that hid the signal.
+
+    Cosine is scale-free, so unlike the flow objective it cannot be inflated by a drifting
+    representation scale, and it reads on an interpretable range: 0 is perfect, ~1.0 is
+    uncorrelated.
+
+    Returns (per-example loss, per-example copy baseline), both (batch,)."""
     # TOKEN_DIM/NUM_TOKENS are properties of the checkpoint (gemma_2b's width, SigLIP-224's
     # per-camera token count), not of this module -- a different paligemma_variant or image
     # resolution would otherwise fail deep inside AuxProjection's dot_general or
@@ -337,18 +383,19 @@ def compute_aux_loss(
                 "wam_aux.py's TOKEN_DIM/NUM_TOKENS assume gemma_2b + one 224x224 SigLIP camera; "
                 "a different paligemma_variant or image resolution needs those constants updated."
             )
-    noise_rng, time_rng = jax.random.split(rng)
+    del rng  # direct regression is deterministic given the batch; kept for signature stability
 
     context = _standardize(projection(context_tokens))
-    target = jax.lax.stop_gradient(_standardize(projection_ema.apply(target_tokens_raw)))
+    target = jax.lax.stop_gradient(projection_ema.apply(target_tokens_raw))
 
-    noise = jax.random.normal(noise_rng, target.shape, dtype=target.dtype)
     batch = target.shape[0]
-    tau = jax.random.uniform(time_rng, (batch,), dtype=jnp.float32)
-    tau_expanded = tau[:, None, None]
-    noised_future = (1 - tau_expanded) * noise + tau_expanded * target
-    velocity_target = target - noise
-
     k = jnp.full((batch,), offset_k, dtype=jnp.float32)
-    velocity_pred = predictor(context, noised_future, tau=tau, k=k, actions=action_window)
-    return jnp.mean(jnp.square(velocity_pred - velocity_target), axis=(-2, -1))
+    prediction = predictor(context, k=k, actions=action_window)
+
+    per_token = 1.0 - _cosine_similarity(prediction, target)
+    # The copy baseline: what "the future just looks like the present" already scores. Logged
+    # alongside the loss because the loss alone cannot say whether the predictor is doing anything
+    # the identity map would not -- at k=8 (0.27s at 30Hz) the two frames are very close, and a
+    # near-identity solution would otherwise look like success.
+    copy_baseline = 1.0 - _cosine_similarity(context, target)
+    return jnp.mean(per_token, axis=-1), jnp.mean(copy_baseline, axis=-1)

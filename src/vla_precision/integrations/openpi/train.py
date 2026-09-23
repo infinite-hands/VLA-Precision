@@ -264,34 +264,38 @@ def train_step_with_aux(
         target_model = nnx.merge(state.model_def, state.ema_params)
         target_tokens_raw, _, _ = target_model.embed_prefix(future_obs)
 
-        aux_loss = jnp.mean(
-            wam_aux.compute_aux_loss(
-                projection,
-                predictor,
-                aux_state.projection_ema,
-                aux_rng,
-                context_tokens=context_tokens,
-                target_tokens_raw=target_tokens_raw,
-                offset_k=aux_loss_offset_k,
-                action_window=actions[:, :aux_loss_offset_k, :],
-            )
+        per_example_aux, per_example_copy = wam_aux.compute_aux_loss(
+            projection,
+            predictor,
+            aux_state.projection_ema,
+            aux_rng,
+            context_tokens=context_tokens,
+            target_tokens_raw=target_tokens_raw,
+            offset_k=aux_loss_offset_k,
+            action_window=actions[:, :aux_loss_offset_k, :],
         )
+        aux_loss = jnp.mean(per_example_aux)
         total_loss = primary_loss + aux_loss_weight * aux_loss
-        return total_loss, (primary_loss, aux_loss)
+        return total_loss, (primary_loss, aux_loss, jnp.mean(per_example_copy))
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions, aux_future_image = batch
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
     argnums = (diff_state, nnx.DiffState(1, nnx.All(nnx.Param)), nnx.DiffState(2, nnx.All(nnx.Param)))
-    (loss, (primary_loss, aux_loss)), (grads, grads_projection, grads_predictor) = nnx.value_and_grad(
-        loss_fn, argnums=argnums, has_aux=True
-    )(model, projection, predictor, train_rng, observation, actions, aux_future_image)
+    (loss, (primary_loss, aux_loss, aux_copy_baseline)), (grads, grads_projection, grads_predictor) = (
+        nnx.value_and_grad(loss_fn, argnums=argnums, has_aux=True)(
+            model, projection, predictor, train_rng, observation, actions, aux_future_image
+        )
+    )
 
     new_state, info = _apply_model_update(config, model, state, grads, loss)
     new_aux_state = wam_aux.apply_aux_update(aux_state, grads_projection, grads_predictor)
     info["primary_loss"] = primary_loss
     info["aux_loss"] = aux_loss
+    # What "the future looks just like the present" already scores. aux_loss meaningfully below
+    # this is the only evidence the predictor is doing something an identity map would not.
+    info["aux_copy_baseline"] = aux_copy_baseline
     return new_state, new_aux_state, info
 
 
