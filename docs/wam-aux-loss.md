@@ -124,6 +124,32 @@ backbone. Isolated reproduction (no backbone, synthetic inputs, 500 steps):
 Normalizing both sides is what BYOL/JEPA implementations do for exactly this reason. It costs the
 per-token magnitude as a predictable signal, which is an accepted trade for a bounded objective.
 
+## Choosing the offset k, and why it is bounded by the action horizon
+
+`aux_loss_offset_k` sets two things at once: how far ahead the future FRAME is (via the extra
+`delta_timestamps` entry) and how much of the action chunk conditions the predictor
+(`actions[:, :k, :]`). `build_stage1_train_config` therefore requires `0 < k < action_horizon`,
+which for the Stage-I profile's `action_horizon=30` caps k at 29 (~0.97s at 30Hz).
+
+That bound is semantic, not a code limitation. Past the action horizon the actions genuinely do not
+exist, so the predictor would have to marginalize over what the robot did in the unconditioned
+tail — a different and considerably more ambiguous task. Raising the ceiling means raising
+`action_horizon` (which changes the policy itself) or deliberately accepting partial conditioning.
+
+**k must not be too small, and the failure is silent.** At k=8 (0.27s) the task is very nearly
+trivial: measured on a real run, `copy_baseline` was **0.016 at step 0**, i.e. the present and
+future embeddings were already ~98.4% cosine-similar before any training. The loss duly fell to
+0.0026 — but that is only ~2x better than emitting the present unchanged, so the predictor was
+learning a small correction to the identity map rather than any dynamics. The headline loss looked
+like a clean success; only `copy_baseline` revealed otherwise. For reference, JEPA-WAM uses δ=31 on
+LIBERO and δ=50 on RoboTwin.
+
+Also watch `aux_collapse` alongside it. On that same k=8 run `copy_baseline` *fell* from 0.41 to
+0.005 during training, meaning present and future grew steadily more identical — the direction of
+the degenerate solution where the representation stops encoding change altogether. `copy_baseline`
+cannot attribute that on its own, since it also moves when the predictor improves or the shared
+projection adapts, which is why `aux_collapse` (a property of the target directions only) exists.
+
 ## Separate optimizer state
 
 The predictor + projection have their **own** Adam optimizer (`wam_aux.AuxState`,
