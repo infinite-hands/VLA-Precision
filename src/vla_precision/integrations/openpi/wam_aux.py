@@ -114,6 +114,30 @@ def _standardize(x: jax.Array) -> jax.Array:
     return (x - mean) * jax.lax.rsqrt(variance + 1e-6)
 
 
+def _center(x: jax.Array) -> jax.Array:
+    """Subtract the population mean DIRECTION, taken over (batch, tokens) so the result is a single
+    (feature,) vector removed from every token.
+
+    Transformer embeddings are strongly anisotropic -- they occupy a narrow cone rather than the
+    full sphere -- so before centering, every pair of PaliGemma embeddings is highly cosine-similar
+    regardless of content. Measured on a real run: the collapse metric (norm of the mean unit
+    target) read 0.972 at step 0, BEFORE any training, meaning the shared direction accounts for
+    ~97% of a typical unit vector. That made cosine a near-useless discriminator: `copy_baseline`
+    was 0.016 at k=8 and only 0.026 at k=29, i.e. quadrupling the horizon from 0.27s to ~1s barely
+    moved it -- not because the scene does not change, but because everything is similar to
+    everything in that cone. Removing the shared component leaves the ~0.23-norm residual that
+    actually varies with content.
+
+    Note `_standardize` does NOT do this: it removes each token's own mean along the feature axis,
+    which is a per-token operation and leaves the shared cross-token direction untouched.
+
+    Uses the batch mean, so the loss depends mildly on the other samples in the batch (as BatchNorm
+    does). DINO instead keeps an EMA of this mean to remove that dependence; worth revisiting if
+    batch size ever gets small enough for the estimate to be noisy (here it is over
+    batch * 256 tokens)."""
+    return x - jnp.mean(x, axis=(-3, -2), keepdims=True)
+
+
 def _cosine_similarity(a: jax.Array, b: jax.Array) -> jax.Array:
     """Per-token cosine similarity along the feature axis, returning (..., num_tokens)."""
     a_norm = a * jax.lax.rsqrt(jnp.sum(jnp.square(a), axis=-1, keepdims=True) + 1e-8)
@@ -389,14 +413,16 @@ def compute_aux_loss(
             )
     del rng  # direct regression is deterministic given the batch; kept for signature stability
 
-    context = _standardize(projection(context_tokens))
-    target = jax.lax.stop_gradient(projection_ema.apply(target_tokens_raw))
+    # Centered before any similarity is taken: see _center for why cosine is otherwise dominated
+    # by PaliGemma's shared anisotropy direction rather than by content.
+    context = _center(_standardize(projection(context_tokens)))
+    target = jax.lax.stop_gradient(_center(projection_ema.apply(target_tokens_raw)))
 
     batch = target.shape[0]
     k = jnp.full((batch,), offset_k, dtype=jnp.float32)
     prediction = predictor(context, k=k, actions=action_window)
 
-    per_token = 1.0 - _cosine_similarity(prediction, target)
+    per_token = 1.0 - _cosine_similarity(_center(prediction), target)
     # The copy baseline: what "the future just looks like the present" already scores. Logged
     # alongside the loss because the loss alone cannot say whether the predictor is doing anything
     # the identity map would not -- at small k the two frames are very close (measured: 0.016 at
