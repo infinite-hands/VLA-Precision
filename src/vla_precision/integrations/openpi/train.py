@@ -213,7 +213,7 @@ def train_step_with_aux(
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     aux_state: wam_aux.AuxState,
-    batch: tuple[_model.Observation, _model.Actions, at.Float[at.Array, "*b h w c"]],
+    batch: tuple[_model.Observation, _model.Actions, at.Float[at.Array, "*b h w c"], at.Bool[at.Array, "*b"]],
 ) -> tuple[training_utils.TrainState, wam_aux.AuxState, dict[str, at.Array]]:
     """WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md): identical to `train_step`
     except it also differentiates a combined (primary + aux_loss_weight * aux) loss w.r.t. the aux
@@ -235,6 +235,7 @@ def train_step_with_aux(
         observation: _model.Observation,
         actions: _model.Actions,
         aux_future_image: at.Array,
+        aux_is_pad: at.Array,
     ):
         primary_rng, aux_rng = jax.random.split(rng)
         primary_loss = jnp.mean(model.compute_loss(primary_rng, observation, actions, train=True))
@@ -273,19 +274,20 @@ def train_step_with_aux(
             target_tokens_raw=target_tokens_raw,
             offset_k=aux_loss_offset_k,
             action_window=actions[:, :aux_loss_offset_k, :],
+            is_pad=aux_is_pad,
         )
         aux_loss = jnp.mean(per_example_aux)
         total_loss = primary_loss + aux_loss_weight * aux_loss
         return total_loss, (primary_loss, aux_loss, jnp.mean(per_example_copy), aux_collapse)
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions, aux_future_image = batch
+    observation, actions, aux_future_image, aux_is_pad = batch
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
     argnums = (diff_state, nnx.DiffState(1, nnx.All(nnx.Param)), nnx.DiffState(2, nnx.All(nnx.Param)))
     (loss, (primary_loss, aux_loss, aux_copy_baseline, aux_collapse)), (grads, grads_projection, grads_predictor) = (
         nnx.value_and_grad(loss_fn, argnums=argnums, has_aux=True)(
-            model, projection, predictor, train_rng, observation, actions, aux_future_image
+            model, projection, predictor, train_rng, observation, actions, aux_future_image, aux_is_pad
         )
     )
 

@@ -30,6 +30,10 @@ RIGHT_WRIST_CAMERA_KEY = "right_wrist_0_rgb"
 # typo on either side cannot silently degrade to "aux quietly disabled" (DualURInputs below guards
 # with `if ... in data`, so a mismatched key would otherwise just skip the aux branch, not error).
 FUTURE_RIGHT_WRIST_REPACK_KEY = "observation/future_right_wrist_image"
+# Marks samples where LeRobot clamped the future index at an episode boundary, so the "future"
+# frame is really the current one. Masked out of the loss rather than averaged in.
+FUTURE_RIGHT_WRIST_PAD_KEY = "observation/future_right_wrist_is_pad"
+AUX_FUTURE_PAD_KEY = "aux_future_is_pad"
 
 # WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md): the future right-wrist frame
 # is stashed under this key INSIDE inputs["image"] (not as its own top-level key) purely so
@@ -113,6 +117,7 @@ class DualURInputs(transforms.DataTransformFn):
         # never reaches embed_prefix()'s per-camera loop.
         if FUTURE_RIGHT_WRIST_REPACK_KEY in data:
             inputs["image"][AUX_FUTURE_IMAGE_KEY] = _parse_image(data[FUTURE_RIGHT_WRIST_REPACK_KEY])
+            inputs[AUX_FUTURE_PAD_KEY] = np.asarray(data[FUTURE_RIGHT_WRIST_PAD_KEY], dtype=bool)
 
         return inputs
 

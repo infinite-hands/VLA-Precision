@@ -337,7 +337,8 @@ def compute_aux_loss(
     target_tokens_raw: jax.Array,
     offset_k: int,
     action_window: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
+    is_pad: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """WAM auxiliary future-prediction loss (see docs/wam-aux-loss.md): mean per-token cosine
     distance between the predicted and the EMA-encoded future embedding, which is what JEPA-WAM
     (arXiv 2608.09381) uses for exactly this objective on exactly this base model (pi0.5), and
@@ -368,6 +369,11 @@ def compute_aux_loss(
     representation scale, and it reads on an interpretable range: 0 is perfect, ~1.0 is
     uncorrelated.
 
+    `is_pad` marks samples where LeRobot clamped the future index at an episode boundary, so the
+    "future" frame is really the current one. Those are excluded from both returned per-example
+    quantities: they are trivially satisfiable, and left in they would ALSO depress copy_baseline,
+    corrupting the very instrument that exists to detect triviality.
+
     Returns (per-example loss, per-example copy baseline, scalar collapse metric)."""
     # TOKEN_DIM/NUM_TOKENS are properties of the checkpoint (gemma_2b's width, SigLIP-224's
     # per-camera token count), not of this module -- a different paligemma_variant or image
@@ -397,6 +403,16 @@ def compute_aux_loss(
     # k=8, i.e. 98.4% cosine-similar before any training at all), and a near-identity solution
     # would otherwise look like success.
     copy_baseline = 1.0 - _cosine_similarity(context, target)
+
+    per_example = jnp.mean(per_token, axis=-1)
+    per_example_copy = jnp.mean(copy_baseline, axis=-1)
+    if is_pad is not None:
+        # Zero the clamped samples and rescale by how many remain, so the batch mean the caller
+        # takes is the mean over VALID samples rather than a diluted average.
+        keep = (~is_pad).astype(per_example.dtype)
+        scale = keep.size / jnp.maximum(jnp.sum(keep), 1.0)
+        per_example = per_example * keep * scale
+        per_example_copy = per_example_copy * keep * scale
     # Collapse detector. The cheapest way to satisfy a self-predictive loss is to stop encoding
     # change -- if every token maps to the same direction, present and future match trivially and
     # the policy loses its ability to perceive motion. For L2-normalized targets the mean vector's
@@ -405,4 +421,4 @@ def compute_aux_loss(
     # copy_baseline it does not move just because the predictor improved.
     normalized = target * jax.lax.rsqrt(jnp.sum(jnp.square(target), axis=-1, keepdims=True) + 1e-8)
     collapse = jnp.linalg.norm(jnp.mean(normalized, axis=(-3, -2)), axis=-1)
-    return jnp.mean(per_token, axis=-1), jnp.mean(copy_baseline, axis=-1), collapse
+    return per_example, per_example_copy, collapse

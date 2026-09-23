@@ -9,6 +9,8 @@ install_lerobot_import_compat()
 import dataclasses
 import pathlib
 
+import numpy as np
+
 from openpi import transforms
 from openpi.models import model as openpi_model
 from openpi.training import config as openpi_config
@@ -17,6 +19,7 @@ from typing_extensions import override
 from vla_precision.integrations.openpi.policies import dual_ur, franka, ur5e
 
 AUX_FUTURE_RAW_KEY_SUFFIX = "__aux_future"  # appended to the raw LeRobot column name that carries the extra delta_timestamps frame
+AUX_FUTURE_PAD_KEY_SUFFIX = "__aux_future_is_pad"  # LeRobot clamps at episode ends; this marks the samples where "future" is really the current frame
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,7 +30,15 @@ class SplitAuxFutureFrame(transforms.DataTransformFn):
     before RepackTransform, so it can restore `raw_key` to just the current frame (index 0) --
     every downstream transform for that key is then bit-identical to a run with aux loss
     disabled -- and expose the future frame (index 1) under its own new key, which
-    RepackTransform's (separately extended) mapping then forwards into DualURInputs."""
+    RepackTransform's (separately extended) mapping then forwards into DualURInputs.
+
+    Also carries LeRobot's own `<raw_key>_is_pad` flag for the second timestamp. LeRobot's
+    `_get_query_indices` CLAMPS the requested index with `min(episode_end - 1, idx + delta)`, so for
+    every sample within `offset_k` frames of an episode boundary the "future" frame IS the current
+    frame -- an exact copy, roughly `offset_k / episode_length` of the corpus (about 5% at k=29 on
+    ~600-frame episodes). Those samples make the objective trivially satisfiable AND drag down
+    `copy_baseline`, i.e. they corrupt the very instrument that exists to detect triviality, so the
+    flag has to reach the loss to be masked out rather than being silently averaged in."""
 
     raw_key: str
 
@@ -35,6 +46,11 @@ class SplitAuxFutureFrame(transforms.DataTransformFn):
         stacked = data[self.raw_key]
         data[self.raw_key] = stacked[0]
         data[f"{self.raw_key}{AUX_FUTURE_RAW_KEY_SUFFIX}"] = stacked[1]
+        is_pad = data.get(f"{self.raw_key}_is_pad")
+        # False when absent: a dataset that never pads simply has no clamped samples to mask.
+        data[f"{self.raw_key}{AUX_FUTURE_PAD_KEY_SUFFIX}"] = (
+            np.asarray(is_pad)[1] if is_pad is not None else np.False_
+        )
         return data
 
 
@@ -146,6 +162,9 @@ class LeRobotDualUR5eDataConfig(openpi_config.DataConfigFactory):
             repack_inputs.append(SplitAuxFutureFrame(raw_key=right_wrist_raw_key))
             repack_structure[dual_ur.FUTURE_RIGHT_WRIST_REPACK_KEY] = (
                 f"{right_wrist_raw_key}{AUX_FUTURE_RAW_KEY_SUFFIX}"
+            )
+            repack_structure[dual_ur.FUTURE_RIGHT_WRIST_PAD_KEY] = (
+                f"{right_wrist_raw_key}{AUX_FUTURE_PAD_KEY_SUFFIX}"
             )
         repack_inputs.append(transforms.RepackTransform(repack_structure))
         repack = transforms.Group(inputs=repack_inputs)

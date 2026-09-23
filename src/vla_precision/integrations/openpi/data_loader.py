@@ -20,7 +20,7 @@ from vla_precision.config.schema import RootConfig, Stage1Config
 from vla_precision.data.indexing import materialize_lerobot_indices
 from vla_precision.data.paths import source_lerobot_root
 from vla_precision.integrations.openpi.data_configs import SplitAuxFutureFrame
-from vla_precision.integrations.openpi.policies.dual_ur import AUX_FUTURE_IMAGE_KEY
+from vla_precision.integrations.openpi.policies.dual_ur import AUX_FUTURE_IMAGE_KEY, AUX_FUTURE_PAD_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +177,10 @@ class DataLoaderImplWithAux(openpi_data_loader.DataLoaderImpl):
             aux_future_image = batch["image"].pop(AUX_FUTURE_IMAGE_KEY)
             if aux_future_image.dtype == np.uint8:
                 aux_future_image = aux_future_image.astype(np.float32) / 255.0 * 2.0 - 1.0
-            yield _model.Observation.from_dict(batch), batch["actions"], aux_future_image
+            # LeRobot clamps the future index at episode ends, making "future" == current for
+            # roughly offset_k/episode_length of samples; those are masked out of the loss.
+            aux_is_pad = batch.pop(AUX_FUTURE_PAD_KEY)
+            yield _model.Observation.from_dict(batch), batch["actions"], aux_future_image, aux_is_pad
 
 
 def create_data_loader(
